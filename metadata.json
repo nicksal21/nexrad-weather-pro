@@ -1,0 +1,5 @@
+{
+  "name": "NEXRAD Radar Pro",
+  "description": "Advanced NEXRAD radar analysis tool with AI-powered storm tracking and multi-layer reflectivity, velocity, and spectral width interpretation.",
+  "requestFramePermissions": []
+}
