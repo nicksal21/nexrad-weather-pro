@@ -17,6 +17,10 @@ import { NEXRAD_STATIONS } from './src/stations.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const RADAR_IMAGE_SIZE = Number(process.env.RADAR_IMAGE_SIZE) || 1024;
+const RADAR_MAP_IMAGE_SIZE = Number(process.env.RADAR_MAP_IMAGE_SIZE) || 512;
+const RADAR_MAX_FRAMES = Number(process.env.RADAR_MAX_FRAMES) || 3;
+const RADAR_DOWNLOAD_TIMEOUT_MS = Number(process.env.RADAR_DOWNLOAD_TIMEOUT_MS) || 45000;
 
 app.use(cors());
 app.use(express.json());
@@ -167,7 +171,7 @@ function getSWColor(val: number): [number, number, number, number] {
 }
 
 // Image generation
-async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' | 'spectrum', size: number = 2048, rangeKm: number = 250, addMap: boolean = false, stationCoords?: [number, number]) {
+async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' | 'spectrum', size: number = RADAR_IMAGE_SIZE, rangeKm: number = 250, addMap: boolean = false, stationCoords?: [number, number]) {
   const validRadials = radials.filter(r => r[type]);
   if (validRadials.length === 0) return null;
 
@@ -376,12 +380,16 @@ app.post('/api/radar/process', async (req, res) => {
     }
 
     for (const file of files) {
-      if (frames.length >= 10) break;
+      if (frames.length >= RADAR_MAX_FRAMES) break;
 
       const fileUrl = `https://unidata-nexrad-level2.s3.amazonaws.com/${file.Key}`;
       console.log(`[DEBUG] Downloading Level II file: ${fileUrl}`);
-      
-      const fileResponse = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+
+      const fileResponse = await axios.get(fileUrl, {
+        responseType: 'arraybuffer',
+        timeout: RADAR_DOWNLOAD_TIMEOUT_MS,
+        maxContentLength: 80 * 1024 * 1024,
+      });
       const nexradData = new Level2Radar(fileResponse.data);
       
       // Group elevations by rounded angle
@@ -440,14 +448,12 @@ app.post('/api/radar/process', async (req, res) => {
       
       const firstRadial = allRadialsAtThisElev[0];
       const rangeKm = 250;
-      
-      const [refImg, velImg, swImg, refImgMap, velImgMap] = await Promise.all([
-        generateRadarImage(allRadialsAtThisElev, 'reflect', 2048, rangeKm),
-        generateRadarImage(allRadialsAtThisElev, 'velocity', 2048, rangeKm),
-        generateRadarImage(allRadialsAtThisElev, 'spectrum', 2048, rangeKm),
-        generateRadarImage(allRadialsAtThisElev, 'reflect', 2048, rangeKm, true, [sLat, sLon]),
-        generateRadarImage(allRadialsAtThisElev, 'velocity', 2048, rangeKm, true, [sLat, sLon])
-      ]);
+
+      const refImg = await generateRadarImage(allRadialsAtThisElev, 'reflect', RADAR_IMAGE_SIZE, rangeKm);
+      const velImg = await generateRadarImage(allRadialsAtThisElev, 'velocity', RADAR_IMAGE_SIZE, rangeKm);
+      const swImg = await generateRadarImage(allRadialsAtThisElev, 'spectrum', RADAR_IMAGE_SIZE, rangeKm);
+      const refImgMap = await generateRadarImage(allRadialsAtThisElev, 'reflect', RADAR_MAP_IMAGE_SIZE, rangeKm, true, [sLat, sLon]);
+      const velImgMap = await generateRadarImage(allRadialsAtThisElev, 'velocity', RADAR_MAP_IMAGE_SIZE, rangeKm, true, [sLat, sLon]);
 
       if (refImg) {
         const latDiff = rangeKm / 111.32;
@@ -461,7 +467,7 @@ app.post('/api/radar/process', async (req, res) => {
           reflectivity: `data:image/png;base64,${refImg.toString('base64')}`,
           velocity: velImg ? `data:image/png;base64,${velImg.toString('base64')}` : null,
           spectralWidth: swImg ? `data:image/png;base64,${swImg.toString('base64')}` : null,
-          reflectivityMap: `data:image/png;base64,${refImgMap.toString('base64')}`,
+          reflectivityMap: refImgMap ? `data:image/png;base64,${refImgMap.toString('base64')}` : null,
           velocityMap: velImgMap ? `data:image/png;base64,${velImgMap.toString('base64')}` : null,
           bounds,
           elevation: minElevAngle,
@@ -482,7 +488,9 @@ app.post('/api/radar/process', async (req, res) => {
 
   } catch (error: any) {
     console.error('[ERROR] Processing failed:', error.message);
-    res.status(500).json({ error: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message });
+    }
   }
 });
 
@@ -496,13 +504,22 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get(/^(?!\/api\/).*/, (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Radar settings: size=${RADAR_IMAGE_SIZE}, mapSize=${RADAR_MAP_IMAGE_SIZE}, maxFrames=${RADAR_MAX_FRAMES}`);
   });
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[ERROR] Unhandled rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[ERROR] Uncaught exception:', error);
+});
 
 startServer();

@@ -39,6 +39,6 @@ export const getNearestStation = async (lat: number, lon: number, query?: string
 };
 
 export const processRadarData = async (stationId: string) => {
-  const response = await axios.post('/api/radar/process', { stationId });
+  const response = await axios.post('/api/radar/process', { stationId }, { timeout: 120000 });
   return response.data;
 };

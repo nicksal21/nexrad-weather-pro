@@ -481,7 +481,12 @@ Please provide a detailed meteorological analysis including:
       }
     } catch (err: any) {
       console.error('Search Error:', err);
-      setError(err.message || 'An unexpected error occurred.');
+      const status = err.response?.status;
+      if (status === 502 || status === 504) {
+        setError('Radar processing timed out on the server. Try again in a moment, or search by station ID (e.g. KINX).');
+      } else {
+        setError(err.response?.data?.error || err.message || 'An unexpected error occurred.');
+      }
     } finally {
       setLoading(false);
     }
