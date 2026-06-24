@@ -33,3 +33,7 @@ NODE_OPTIONS=--max-old-space-size=448
 ```
 
 **Important:** Do not use `npx tsx server.ts` as the start command — it skips the heap limit and production defaults from `npm start`.
+
+Render automatically sets `RENDER=true`, which enables low-memory radar processing (smaller images, fewer frames, file-size limits). Local runs via `npm run dev` or `npm start` use full-quality settings (2048px images, up to 10 frames, all spectral-width layers, and map overlays for AI analysis).
+
+You can force low-memory mode locally for testing with `RADAR_LOW_MEMORY=true npm run dev`.

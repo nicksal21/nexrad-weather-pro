@@ -17,14 +17,20 @@ import { NEXRAD_STATIONS } from './src/stations.js';
 
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
+const isRenderDeploy = process.env.RENDER === 'true';
+const isLowMemoryMode = isRenderDeploy || process.env.RADAR_LOW_MEMORY === 'true';
 const PORT = Number(process.env.PORT) || 3000;
-const RADAR_IMAGE_SIZE = Number(process.env.RADAR_IMAGE_SIZE) || (isProduction ? 384 : 512);
-const RADAR_MAX_FRAMES = Number(process.env.RADAR_MAX_FRAMES) || (isProduction ? 1 : 2);
+const RADAR_IMAGE_SIZE = Number(process.env.RADAR_IMAGE_SIZE) || (isLowMemoryMode ? 384 : 2048);
+const RADAR_MAX_FRAMES = Number(process.env.RADAR_MAX_FRAMES) || (isLowMemoryMode ? 1 : 10);
 const RADAR_DOWNLOAD_TIMEOUT_MS = Number(process.env.RADAR_DOWNLOAD_TIMEOUT_MS) || 45000;
-const RADAR_MAX_FILE_BYTES = Number(process.env.RADAR_MAX_FILE_BYTES) || (isProduction ? 12 * 1024 * 1024 : 50 * 1024 * 1024);
-const RADAR_RADIAL_STRIDE = Number(process.env.RADAR_RADIAL_STRIDE) || (isProduction ? 2 : 1);
-const RADAR_INCLUDE_SPECTRAL_WIDTH = process.env.RADAR_INCLUDE_SPECTRAL_WIDTH === 'true'
-  || (!isProduction && process.env.RADAR_INCLUDE_SPECTRAL_WIDTH !== 'false');
+const RADAR_MAX_FILE_BYTES = Number(process.env.RADAR_MAX_FILE_BYTES) || (isLowMemoryMode ? 12 * 1024 * 1024 : 100 * 1024 * 1024);
+const RADAR_RADIAL_STRIDE = Number(process.env.RADAR_RADIAL_STRIDE) || (isLowMemoryMode ? 2 : 1);
+const RADAR_INCLUDE_SPECTRAL_WIDTH = process.env.RADAR_INCLUDE_SPECTRAL_WIDTH !== undefined
+  ? process.env.RADAR_INCLUDE_SPECTRAL_WIDTH === 'true'
+  : !isLowMemoryMode;
+const RADAR_INCLUDE_MAP_OVERLAYS = process.env.RADAR_INCLUDE_MAP_OVERLAYS !== undefined
+  ? process.env.RADAR_INCLUDE_MAP_OVERLAYS === 'true'
+  : !isLowMemoryMode;
 
 app.use(cors());
 app.use(express.json());
@@ -175,7 +181,14 @@ function getSWColor(val: number): [number, number, number, number] {
 }
 
 // Image generation
-async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' | 'spectrum', size: number = RADAR_IMAGE_SIZE, rangeKm: number = 250) {
+async function generateRadarImage(
+  radials: any[],
+  type: 'reflect' | 'velocity' | 'spectrum',
+  size: number = RADAR_IMAGE_SIZE,
+  rangeKm: number = 250,
+  addMap: boolean = false,
+  stationCoords?: [number, number]
+) {
   const validRadials = radials.filter(r => r[type]);
   if (validRadials.length === 0) return null;
 
@@ -235,7 +248,36 @@ async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' |
     }
   }
 
-  return sharp(buffer, { raw: { width: size, height: size, channels: 4 } }).png().toBuffer();
+  let image = sharp(buffer, { raw: { width: size, height: size, channels: 4 } });
+
+  if (addMap && stationCoords) {
+    const svgOverlay = Buffer.from(`
+      <svg width="${size}" height="${size}">
+        <rect x="0" y="0" width="${size}" height="${size}" fill="none" stroke="#141414" stroke-width="8"/>
+        <circle cx="${center}" cy="${center}" r="20" fill="none" stroke="red" stroke-width="4"/>
+        <line x1="${center - 40}" y1="${center}" x2="${center + 40}" y2="${center}" stroke="red" stroke-width="4"/>
+        <line x1="${center}" y1="${center - 40}" x2="${center}" y2="${center + 40}" stroke="red" stroke-width="4"/>
+        <text x="40" y="80" font-family="monospace" font-size="48" fill="#141414" font-weight="bold">NEXRAD LEVEL II - ${type.toUpperCase()}</text>
+        <text x="40" y="140" font-family="monospace" font-size="36" fill="#141414">STATION: ${stationCoords[0].toFixed(4)}, ${stationCoords[1].toFixed(4)}</text>
+      </svg>
+    `);
+
+    const background = await sharp({
+      create: {
+        width: size,
+        height: size,
+        channels: 4,
+        background: { r: 228, g: 227, b: 224, alpha: 1 },
+      },
+    }).png().toBuffer();
+
+    image = sharp(background).composite([
+      { input: buffer, raw: { width: size, height: size, channels: 4 } },
+      { input: svgOverlay },
+    ]);
+  }
+
+  return image.png().toBuffer();
 }
 
 function pickSingleElevation(nexradData: Level2Radar, elevNums: number[]): number {
@@ -284,6 +326,8 @@ function selectProcessableFiles(contents: any[]) {
     .filter((f: any) => f.Key && !f.Key.endsWith('_MDM'))
     .sort((a: any, b: any) => b.Key.localeCompare(a.Key));
 
+  if (!isLowMemoryMode) return dataFiles;
+
   const withinLimit = dataFiles.filter((f: any) => !f.Size || Number(f.Size) <= RADAR_MAX_FILE_BYTES);
   if (withinLimit.length > 0) return withinLimit;
 
@@ -299,7 +343,7 @@ async function processNexradFile(fileKey: string, fileSize: number | undefined, 
   const fileResponse = await axios.get(fileUrl, {
     responseType: 'arraybuffer',
     timeout: RADAR_DOWNLOAD_TIMEOUT_MS,
-    maxContentLength: RADAR_MAX_FILE_BYTES,
+    ...(isLowMemoryMode ? { maxContentLength: RADAR_MAX_FILE_BYTES } : {}),
   });
 
   let nexradData: Level2Radar;
@@ -352,22 +396,40 @@ async function processNexradFile(fileKey: string, fileSize: number | undefined, 
     return null;
   }
 
-  const elevNum = pickSingleElevation(nexradData, targetElevNums);
-  const rawRadials = nexradData.data[elevNum] ?? [];
-  const timestamp = new Date(
-    nexradData.header.modified_julian_date * 86400000 + (rawRadials[0]?.record?.mseconds ?? 0)
-  ).getTime();
-  const radialsAtElev = rawRadials
-    .map((r: any, index: number) => ({ record: r.record, index }))
-    .filter(({ index }) => index % RADAR_RADIAL_STRIDE === 0)
-    .map(({ record }) => slimRadial(record));
+  const elevNum = isLowMemoryMode ? pickSingleElevation(nexradData, targetElevNums) : targetElevNums[0];
+  let radialsAtElev: any[];
+  let timestamp: number;
+
+  if (isLowMemoryMode) {
+    const rawRadials = nexradData.data[elevNum] ?? [];
+    timestamp = new Date(
+      nexradData.header.modified_julian_date * 86400000 + (rawRadials[0]?.record?.mseconds ?? 0)
+    ).getTime();
+    radialsAtElev = rawRadials
+      .map((r: any, index: number) => ({ record: r.record, index }))
+      .filter(({ index }) => index % RADAR_RADIAL_STRIDE === 0)
+      .map(({ record }) => slimRadial(record));
+  } else {
+    radialsAtElev = [];
+    for (const e of targetElevNums) {
+      const rds = nexradData.data[e];
+      if (rds) radialsAtElev.push(...rds.map((r: any) => r.record));
+    }
+    timestamp = new Date(
+      nexradData.header.modified_julian_date * 86400000 + (radialsAtElev[0]?.mseconds ?? 0)
+    ).getTime();
+  }
 
   // Release the full parsed archive before image generation.
   nexradData = null as any;
 
   if (radialsAtElev.length === 0) return null;
 
-  console.log(`[DEBUG] Using elevation ${minElevAngle} deg (scan ${elevNum}, ${radialsAtElev.length} radials, stride ${RADAR_RADIAL_STRIDE})`);
+  console.log(
+    isLowMemoryMode
+      ? `[DEBUG] Using elevation ${minElevAngle} deg (scan ${elevNum}, ${radialsAtElev.length} radials, stride ${RADAR_RADIAL_STRIDE})`
+      : `[DEBUG] Lowest elevation angle with all data: ${minElevAngle} deg (Elevations: ${targetElevNums.join(', ')}, ${radialsAtElev.length} radials)`
+  );
 
   const rangeKm = 250;
 
@@ -376,6 +438,15 @@ async function processNexradFile(fileKey: string, fileSize: number | undefined, 
   const swImg = RADAR_INCLUDE_SPECTRAL_WIDTH
     ? await generateRadarImage(radialsAtElev, 'spectrum', RADAR_IMAGE_SIZE, rangeKm)
     : null;
+
+  let refImgMap: Buffer | null = null;
+  let velImgMap: Buffer | null = null;
+  if (RADAR_INCLUDE_MAP_OVERLAYS) {
+    [refImgMap, velImgMap] = await Promise.all([
+      generateRadarImage(radialsAtElev, 'reflect', RADAR_IMAGE_SIZE, rangeKm, true, [sLat, sLon]),
+      generateRadarImage(radialsAtElev, 'velocity', RADAR_IMAGE_SIZE, rangeKm, true, [sLat, sLon]),
+    ]);
+  }
 
   if (!refImg) return null;
 
@@ -390,6 +461,8 @@ async function processNexradFile(fileKey: string, fileSize: number | undefined, 
     reflectivity: `data:image/png;base64,${refImg.toString('base64')}`,
     velocity: velImg ? `data:image/png;base64,${velImg.toString('base64')}` : null,
     spectralWidth: swImg ? `data:image/png;base64,${swImg.toString('base64')}` : null,
+    reflectivityMap: refImgMap ? `data:image/png;base64,${refImgMap.toString('base64')}` : null,
+    velocityMap: velImgMap ? `data:image/png;base64,${velImgMap.toString('base64')}` : null,
     bounds,
     elevation: minElevAngle,
     timestamp,
@@ -485,7 +558,7 @@ app.post('/api/radar/process', async (req, res) => {
     // Filter and sort by key (timestamp is in filename)
     const files = selectProcessableFiles(contents);
 
-    console.log(`[DEBUG] Found ${contents.length} files, ${files.length} candidates under ${Math.round(RADAR_MAX_FILE_BYTES / (1024 * 1024))}MB`);
+    console.log(`[DEBUG] Found ${contents.length} files, ${files.length} candidate scans${isLowMemoryMode ? ` under ${Math.round(RADAR_MAX_FILE_BYTES / (1024 * 1024))}MB` : ''}`);
 
     const frames: any[] = [];
     let sLat: number, sLon: number, sName: string;
@@ -552,9 +625,12 @@ async function startServer() {
   }
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Radar settings: size=${RADAR_IMAGE_SIZE}, maxFrames=${RADAR_MAX_FRAMES}, spectralWidth=${RADAR_INCLUDE_SPECTRAL_WIDTH}, maxFileMB=${Math.round(RADAR_MAX_FILE_BYTES / (1024 * 1024))}, radialStride=${RADAR_RADIAL_STRIDE}`);
-    const heapMb = Math.round((process.memoryUsage().heapTotal) / (1024 * 1024));
-    console.log(`Node heap total: ${heapMb}MB (set NODE_OPTIONS=--max-old-space-size=448 on Render if OOM persists)`);
+    console.log(`Deploy target: ${isLowMemoryMode ? 'Render (low-memory radar processing)' : 'local (full-quality radar processing)'}`);
+    console.log(`Radar settings: size=${RADAR_IMAGE_SIZE}, maxFrames=${RADAR_MAX_FRAMES}, spectralWidth=${RADAR_INCLUDE_SPECTRAL_WIDTH}, mapOverlays=${RADAR_INCLUDE_MAP_OVERLAYS}, maxFileMB=${Math.round(RADAR_MAX_FILE_BYTES / (1024 * 1024))}, radialStride=${RADAR_RADIAL_STRIDE}`);
+    if (isLowMemoryMode) {
+      const heapMb = Math.round((process.memoryUsage().heapTotal) / (1024 * 1024));
+      console.log(`Node heap total: ${heapMb}MB (set NODE_OPTIONS=--max-old-space-size=448 on Render if OOM persists)`);
+    }
   });
 }
 
