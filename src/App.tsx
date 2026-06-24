@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { GoogleGenAI, Type } from "@google/genai";
+import { Type } from "@google/genai";
 import { Search, Wind, CloudRain, MapPin, Loader2, Play, Pause, FastForward, Rewind, Info, AlertTriangle, ChevronLeft, ChevronRight, Layers } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
@@ -15,6 +15,8 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { NEXRAD_STATIONS } from './stations';
+import { ApiKeySettings } from '@/components/ApiKeySettings';
+import { createGeminiClient, getEffectiveApiKey } from '@/lib/geminiApiKey';
 
 const stationMap = new Map();
 NEXRAD_STATIONS.forEach(s => {
@@ -24,8 +26,6 @@ NEXRAD_STATIONS.forEach(s => {
     stationMap.set(s.icao.substring(1).toUpperCase(), s);
   }
 });
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Fix Leaflet icon issue
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -325,6 +325,7 @@ export default function App() {
   const [layerType, setLayerType] = useState<'reflectivity' | 'velocity' | 'spectralWidth'>('reflectivity');
   const [mapTheme, setMapTheme] = useState<'dark' | 'light'>('dark');
   const [resetCounter, setResetCounter] = useState(0);
+  const [hasApiKey, setHasApiKey] = useState(!!getEffectiveApiKey());
 
   const handleSearch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -338,6 +339,9 @@ export default function App() {
     setResolvedLocation(null);
 
     try {
+      const apiKey = getEffectiveApiKey();
+      const ai = createGeminiClient(apiKey);
+
       let lat: number, lon: number, resolvedName: string;
       let currentStation: any = null;
 
@@ -358,7 +362,12 @@ export default function App() {
         };
         setStationInfo(currentStation);
       } else {
-        // Fallback to geocoding if station not found in hardcoded list
+        if (!ai) {
+          throw new Error(
+            'A Gemini API key is required to search by city or zip. Enter your key above, or use a NEXRAD station ID (e.g. KINX).'
+          );
+        }
+
         const locationResponse = await ai.models.generateContent({
           model: "gemini-3-flash-preview",
           contents: `Find the latitude and longitude for the following location: "${location}". Return the result as JSON with keys: lat, lon, resolvedName.`,
@@ -392,8 +401,14 @@ export default function App() {
       const radarResult = await processRadarData(stationId);
       setRadarData(radarResult);
 
+      if (radarResult.frames.length > 0 && !ai) {
+        setAnalysis(
+          'Radar data loaded successfully. Add your Gemini API key above to enable AI-powered meteorological analysis.'
+        );
+      }
+
       // Analyze with Gemini
-      if (radarResult.frames.length > 0) {
+      if (radarResult.frames.length > 0 && ai) {
         const latestFrame = radarResult.frames[radarResult.frames.length - 1];
         const nwLat = latestFrame.bounds[1][0];
         const nwLon = latestFrame.bounds[0][1];
@@ -474,33 +489,37 @@ Please provide a detailed meteorological analysis including:
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] font-sans selection:bg-[#141414] selection:text-[#E4E3E0]">
-      <header className="border-b border-[#141414] p-6 flex flex-col md:flex-row justify-between items-center gap-4">
-        <div>
-          <h1 className="text-3xl font-black uppercase tracking-tighter flex items-center gap-2">
-            <Wind className="w-8 h-8" />
-            NEXRAD Radar Pro
-          </h1>
-          <p className="text-xs font-mono opacity-60 uppercase tracking-widest">Advanced Meteorological Analysis System</p>
-        </div>
-        
-        <form onSubmit={handleSearch} className="flex w-full md:w-auto gap-2">
-          <div className="relative flex-1 md:w-80">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 opacity-40" />
-            <Input 
-              placeholder="Enter Zip, City, or Station (e.g. KINX)..." 
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
-              className="pl-10 bg-transparent border-[#141414] rounded-none focus-visible:ring-0 focus-visible:border-b-2"
-            />
+      <header className="border-b border-[#141414] p-6 flex flex-col gap-6">
+        <div className="flex flex-col md:flex-row justify-between items-center gap-4">
+          <div>
+            <h1 className="text-3xl font-black uppercase tracking-tighter flex items-center gap-2">
+              <Wind className="w-8 h-8" />
+              NEXRAD Radar Pro
+            </h1>
+            <p className="text-xs font-mono opacity-60 uppercase tracking-widest">Advanced Meteorological Analysis System</p>
           </div>
-          <Button 
-            type="submit" 
-            disabled={loading}
-            className="bg-[#141414] text-[#E4E3E0] rounded-none hover:bg-[#141414]/90 px-8 uppercase font-bold tracking-tight"
-          >
-            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Analyze'}
-          </Button>
-        </form>
+
+          <form onSubmit={handleSearch} className="flex w-full md:w-auto gap-2">
+            <div className="relative flex-1 md:w-80">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 opacity-40" />
+              <Input
+                placeholder="Enter Zip, City, or Station (e.g. KINX)..."
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+                className="pl-10 bg-transparent border-[#141414] rounded-none focus-visible:ring-0 focus-visible:border-b-2"
+              />
+            </div>
+            <Button
+              type="submit"
+              disabled={loading}
+              className="bg-[#141414] text-[#E4E3E0] rounded-none hover:bg-[#141414]/90 px-8 uppercase font-bold tracking-tight"
+            >
+              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Analyze'}
+            </Button>
+          </form>
+        </div>
+
+        <ApiKeySettings onKeyChange={setHasApiKey} />
       </header>
 
       <main className="p-6 max-w-7xl mx-auto">
@@ -519,7 +538,13 @@ Please provide a detailed meteorological analysis including:
               <h2 className="text-2xl font-bold uppercase tracking-tight mb-2">Ready for Analysis</h2>
               <p className="text-sm font-mono opacity-60 max-w-md">
                 Enter a US location to fetch real-time NEXRAD Level II data and generate AI-powered storm tracking insights.
+                Add your Gemini API key above to enable geocoding and AI analysis.
               </p>
+              {!hasApiKey && (
+                <p className="text-xs font-mono text-amber-800 bg-amber-50 border border-amber-200 px-4 py-2 mt-4 max-w-md">
+                  No API key configured. Station IDs (e.g. KINX) work without a key; city and zip searches require one.
+                </p>
+              )}
             </motion.div>
           )}
 
