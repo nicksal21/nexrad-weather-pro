@@ -16,11 +16,15 @@ const __dirname = dirname(__filename);
 import { NEXRAD_STATIONS } from './src/stations.js';
 
 const app = express();
+const isProduction = process.env.NODE_ENV === 'production';
 const PORT = Number(process.env.PORT) || 3000;
-const RADAR_IMAGE_SIZE = Number(process.env.RADAR_IMAGE_SIZE) || 512;
-const RADAR_MAX_FRAMES = Number(process.env.RADAR_MAX_FRAMES) || 2;
+const RADAR_IMAGE_SIZE = Number(process.env.RADAR_IMAGE_SIZE) || (isProduction ? 384 : 512);
+const RADAR_MAX_FRAMES = Number(process.env.RADAR_MAX_FRAMES) || (isProduction ? 1 : 2);
 const RADAR_DOWNLOAD_TIMEOUT_MS = Number(process.env.RADAR_DOWNLOAD_TIMEOUT_MS) || 45000;
-const RADAR_INCLUDE_SPECTRAL_WIDTH = process.env.RADAR_INCLUDE_SPECTRAL_WIDTH !== 'false';
+const RADAR_MAX_FILE_BYTES = Number(process.env.RADAR_MAX_FILE_BYTES) || (isProduction ? 12 * 1024 * 1024 : 50 * 1024 * 1024);
+const RADAR_RADIAL_STRIDE = Number(process.env.RADAR_RADIAL_STRIDE) || (isProduction ? 2 : 1);
+const RADAR_INCLUDE_SPECTRAL_WIDTH = process.env.RADAR_INCLUDE_SPECTRAL_WIDTH === 'true'
+  || (!isProduction && process.env.RADAR_INCLUDE_SPECTRAL_WIDTH !== 'false');
 
 app.use(cors());
 app.use(express.json());
@@ -261,16 +265,49 @@ function pickSingleElevation(nexradData: Level2Radar, elevNums: number[]): numbe
   return best;
 }
 
-async function processNexradFile(fileKey: string, sLat: number, sLon: number) {
+function slimRadial(record: any) {
+  const slim: any = { azimuth: record.azimuth };
+  for (const type of ['reflect', 'velocity', 'spectrum'] as const) {
+    const moment = record[type];
+    if (moment) {
+      slim[type] = {
+        gate_size: moment.gate_size,
+        moment_data: moment.moment_data,
+      };
+    }
+  }
+  return slim;
+}
+
+function selectProcessableFiles(contents: any[]) {
+  const dataFiles = contents
+    .filter((f: any) => f.Key && !f.Key.endsWith('_MDM'))
+    .sort((a: any, b: any) => b.Key.localeCompare(a.Key));
+
+  const withinLimit = dataFiles.filter((f: any) => !f.Size || Number(f.Size) <= RADAR_MAX_FILE_BYTES);
+  if (withinLimit.length > 0) return withinLimit;
+
+  console.warn(`[WARN] No files under ${Math.round(RADAR_MAX_FILE_BYTES / (1024 * 1024))}MB; using smallest available scans`);
+  return [...dataFiles]
+    .sort((a: any, b: any) => Number(a.Size || 0) - Number(b.Size || 0));
+}
+
+async function processNexradFile(fileKey: string, fileSize: number | undefined, sLat: number, sLon: number) {
   const fileUrl = `https://unidata-nexrad-level2.s3.amazonaws.com/${fileKey}`;
-  console.log(`[DEBUG] Downloading Level II file: ${fileUrl}`);
+  console.log(`[DEBUG] Downloading Level II file (${fileSize ? `${Math.round(Number(fileSize) / (1024 * 1024))}MB` : 'unknown size'}): ${fileUrl}`);
 
   const fileResponse = await axios.get(fileUrl, {
     responseType: 'arraybuffer',
     timeout: RADAR_DOWNLOAD_TIMEOUT_MS,
-    maxContentLength: 50 * 1024 * 1024,
+    maxContentLength: RADAR_MAX_FILE_BYTES,
   });
-  const nexradData = new Level2Radar(fileResponse.data);
+
+  let nexradData: Level2Radar;
+  try {
+    nexradData = new Level2Radar(fileResponse.data);
+  } finally {
+    (fileResponse as any).data = null;
+  }
 
   const elevations = nexradData.listElevations();
   const elevGroups = new Map<number, number[]>();
@@ -316,13 +353,22 @@ async function processNexradFile(fileKey: string, sLat: number, sLon: number) {
   }
 
   const elevNum = pickSingleElevation(nexradData, targetElevNums);
-  const radialsAtElev = nexradData.data[elevNum]?.map((r: any) => r.record) ?? [];
+  const rawRadials = nexradData.data[elevNum] ?? [];
+  const timestamp = new Date(
+    nexradData.header.modified_julian_date * 86400000 + (rawRadials[0]?.record?.mseconds ?? 0)
+  ).getTime();
+  const radialsAtElev = rawRadials
+    .map((r: any, index: number) => ({ record: r.record, index }))
+    .filter(({ index }) => index % RADAR_RADIAL_STRIDE === 0)
+    .map(({ record }) => slimRadial(record));
+
+  // Release the full parsed archive before image generation.
+  nexradData = null as any;
+
   if (radialsAtElev.length === 0) return null;
 
-  console.log(`[DEBUG] Using elevation ${minElevAngle} deg (scan ${elevNum}, ${radialsAtElev.length} radials)`);
+  console.log(`[DEBUG] Using elevation ${minElevAngle} deg (scan ${elevNum}, ${radialsAtElev.length} radials, stride ${RADAR_RADIAL_STRIDE})`);
 
-  const firstRadial = radialsAtElev[0];
-  const timestamp = new Date(nexradData.header.modified_julian_date * 86400000 + firstRadial.mseconds).getTime();
   const rangeKm = 250;
 
   const refImg = await generateRadarImage(radialsAtElev, 'reflect', RADAR_IMAGE_SIZE, rangeKm);
@@ -437,11 +483,9 @@ app.post('/api/radar/process', async (req, res) => {
     if (!Array.isArray(contents)) contents = [contents];
 
     // Filter and sort by key (timestamp is in filename)
-    const files = contents
-      .filter((f: any) => !f.Key.endsWith('_MDM'))
-      .sort((a: any, b: any) => b.Key.localeCompare(a.Key));
+    const files = selectProcessableFiles(contents);
 
-    console.log(`[DEBUG] Found ${files.length} latest files`);
+    console.log(`[DEBUG] Found ${contents.length} files, ${files.length} candidates under ${Math.round(RADAR_MAX_FILE_BYTES / (1024 * 1024))}MB`);
 
     const frames: any[] = [];
     let sLat: number, sLon: number, sName: string;
@@ -466,8 +510,12 @@ app.post('/api/radar/process', async (req, res) => {
 
     for (const file of files) {
       if (frames.length >= RADAR_MAX_FRAMES) break;
-      const frame = await processNexradFile(file.Key, sLat, sLon);
+      const frame = await processNexradFile(file.Key, file.Size, sLat, sLon);
       if (frame) frames.push(frame);
+    }
+
+    if (frames.length === 0) {
+      throw new Error('No processable radar scans found. Recent files may be too large for this server.');
     }
 
     // Sort frames chronologically
@@ -504,7 +552,9 @@ async function startServer() {
   }
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Radar settings: size=${RADAR_IMAGE_SIZE}, maxFrames=${RADAR_MAX_FRAMES}, spectralWidth=${RADAR_INCLUDE_SPECTRAL_WIDTH}`);
+    console.log(`Radar settings: size=${RADAR_IMAGE_SIZE}, maxFrames=${RADAR_MAX_FRAMES}, spectralWidth=${RADAR_INCLUDE_SPECTRAL_WIDTH}, maxFileMB=${Math.round(RADAR_MAX_FILE_BYTES / (1024 * 1024))}, radialStride=${RADAR_RADIAL_STRIDE}`);
+    const heapMb = Math.round((process.memoryUsage().heapTotal) / (1024 * 1024));
+    console.log(`Node heap total: ${heapMb}MB (set NODE_OPTIONS=--max-old-space-size=448 on Render if OOM persists)`);
   });
 }
 
