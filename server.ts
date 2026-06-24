@@ -17,10 +17,10 @@ import { NEXRAD_STATIONS } from './src/stations.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
-const RADAR_IMAGE_SIZE = Number(process.env.RADAR_IMAGE_SIZE) || 1024;
-const RADAR_MAP_IMAGE_SIZE = Number(process.env.RADAR_MAP_IMAGE_SIZE) || 512;
-const RADAR_MAX_FRAMES = Number(process.env.RADAR_MAX_FRAMES) || 3;
+const RADAR_IMAGE_SIZE = Number(process.env.RADAR_IMAGE_SIZE) || 512;
+const RADAR_MAX_FRAMES = Number(process.env.RADAR_MAX_FRAMES) || 2;
 const RADAR_DOWNLOAD_TIMEOUT_MS = Number(process.env.RADAR_DOWNLOAD_TIMEOUT_MS) || 45000;
+const RADAR_INCLUDE_SPECTRAL_WIDTH = process.env.RADAR_INCLUDE_SPECTRAL_WIDTH !== 'false';
 
 app.use(cors());
 app.use(express.json());
@@ -171,7 +171,7 @@ function getSWColor(val: number): [number, number, number, number] {
 }
 
 // Image generation
-async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' | 'spectrum', size: number = RADAR_IMAGE_SIZE, rangeKm: number = 250, addMap: boolean = false, stationCoords?: [number, number]) {
+async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' | 'spectrum', size: number = RADAR_IMAGE_SIZE, rangeKm: number = 250) {
   const validRadials = radials.filter(r => r[type]);
   if (validRadials.length === 0) return null;
 
@@ -179,8 +179,8 @@ async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' |
   const center = size / 2;
   const pixelsPerKm = center / rangeKm;
 
-  // Sort radials by azimuth for faster lookup
-  const sortedRadials = [...validRadials].sort((a, b) => a.azimuth - b.azimuth);
+  validRadials.sort((a, b) => a.azimuth - b.azimuth);
+  const sortedRadials = validRadials;
 
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
@@ -193,7 +193,6 @@ async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' |
       let theta = (Math.atan2(dx, dy) * 180) / Math.PI;
       if (theta < 0) theta += 360;
 
-      // Binary search for nearest radial
       let low = 0;
       let high = sortedRadials.length - 1;
       let radialIdx = 0;
@@ -232,37 +231,123 @@ async function generateRadarImage(radials: any[], type: 'reflect' | 'velocity' |
     }
   }
 
-  let image = sharp(buffer, { raw: { width: size, height: size, channels: 4 } });
+  return sharp(buffer, { raw: { width: size, height: size, channels: 4 } }).png().toBuffer();
+}
 
-  if (addMap && stationCoords) {
-    const svgOverlay = Buffer.from(`
-      <svg width="${size}" height="${size}">
-        <rect x="0" y="0" width="${size}" height="${size}" fill="none" stroke="#141414" stroke-width="8"/>
-        <circle cx="${center}" cy="${center}" r="20" fill="none" stroke="red" stroke-width="4"/>
-        <line x1="${center-40}" y1="${center}" x2="${center+40}" y2="${center}" stroke="red" stroke-width="4"/>
-        <line x1="${center}" y1="${center-40}" x2="${center}" y2="${center+40}" stroke="red" stroke-width="4"/>
-        <text x="40" y="80" font-family="monospace" font-size="48" fill="#141414" font-weight="bold">NEXRAD LEVEL II - ${type.toUpperCase()}</text>
-        <text x="40" y="140" font-family="monospace" font-size="36" fill="#141414">STATION: ${stationCoords[0].toFixed(4)}, ${stationCoords[1].toFixed(4)}</text>
-      </svg>
-    `);
-    
-    const background = await sharp({
-      create: {
-        width: size,
-        height: size,
-        channels: 4,
-        background: { r: 228, g: 227, b: 224, alpha: 1 }
-      }
-    }).png().toBuffer();
+function pickSingleElevation(nexradData: Level2Radar, elevNums: number[]): number {
+  let best = elevNums[0];
+  let bestCount = 0;
 
-    image = sharp(background)
-      .composite([
-        { input: buffer, raw: { width: size, height: size, channels: 4 } },
-        { input: svgOverlay }
-      ]);
+  for (const elevNum of elevNums) {
+    const radials = nexradData.data[elevNum];
+    if (!radials?.length) continue;
+
+    let hasReflect = false;
+    let hasVelocity = false;
+    let hasSpectrum = false;
+    for (const radial of radials) {
+      if (radial.record.reflect) hasReflect = true;
+      if (radial.record.velocity) hasVelocity = true;
+      if (radial.record.spectrum) hasSpectrum = true;
+      if (hasReflect && hasVelocity && hasSpectrum) break;
+    }
+
+    if (hasReflect && hasVelocity && hasSpectrum && radials.length > bestCount) {
+      best = elevNum;
+      bestCount = radials.length;
+    }
   }
 
-  return image.png().toBuffer();
+  return best;
+}
+
+async function processNexradFile(fileKey: string, sLat: number, sLon: number) {
+  const fileUrl = `https://unidata-nexrad-level2.s3.amazonaws.com/${fileKey}`;
+  console.log(`[DEBUG] Downloading Level II file: ${fileUrl}`);
+
+  const fileResponse = await axios.get(fileUrl, {
+    responseType: 'arraybuffer',
+    timeout: RADAR_DOWNLOAD_TIMEOUT_MS,
+    maxContentLength: 50 * 1024 * 1024,
+  });
+  const nexradData = new Level2Radar(fileResponse.data);
+
+  const elevations = nexradData.listElevations();
+  const elevGroups = new Map<number, number[]>();
+
+  for (const elevNum of elevations) {
+    const radials = nexradData.data[elevNum];
+    if (!radials || radials.length === 0) continue;
+    const angle = Math.round(radials[0].record.elevation_angle * 10) / 10;
+    if (!elevGroups.has(angle)) elevGroups.set(angle, []);
+    elevGroups.get(angle)!.push(elevNum);
+  }
+
+  let targetElevNums: number[] = [];
+  let minElevAngle = 999;
+
+  for (const [angle, elevNums] of Array.from(elevGroups.entries()).sort((a, b) => a[0] - b[0])) {
+    let hasReflect = false;
+    let hasVelocity = false;
+    let hasSpectrum = false;
+
+    for (const e of elevNums) {
+      const rds = nexradData.data[e];
+      if (!rds) continue;
+      for (const r of rds) {
+        if (r.record.reflect) hasReflect = true;
+        if (r.record.velocity) hasVelocity = true;
+        if (r.record.spectrum) hasSpectrum = true;
+        if (hasReflect && hasVelocity && hasSpectrum) break;
+      }
+      if (hasReflect && hasVelocity && hasSpectrum) break;
+    }
+
+    if (hasReflect && hasVelocity && hasSpectrum) {
+      minElevAngle = angle;
+      targetElevNums = elevNums;
+      break;
+    }
+  }
+
+  if (targetElevNums.length === 0) {
+    console.log(`[DEBUG] No elevation found with all three data types in file ${fileKey}. Skipping.`);
+    return null;
+  }
+
+  const elevNum = pickSingleElevation(nexradData, targetElevNums);
+  const radialsAtElev = nexradData.data[elevNum]?.map((r: any) => r.record) ?? [];
+  if (radialsAtElev.length === 0) return null;
+
+  console.log(`[DEBUG] Using elevation ${minElevAngle} deg (scan ${elevNum}, ${radialsAtElev.length} radials)`);
+
+  const firstRadial = radialsAtElev[0];
+  const timestamp = new Date(nexradData.header.modified_julian_date * 86400000 + firstRadial.mseconds).getTime();
+  const rangeKm = 250;
+
+  const refImg = await generateRadarImage(radialsAtElev, 'reflect', RADAR_IMAGE_SIZE, rangeKm);
+  const velImg = await generateRadarImage(radialsAtElev, 'velocity', RADAR_IMAGE_SIZE, rangeKm);
+  const swImg = RADAR_INCLUDE_SPECTRAL_WIDTH
+    ? await generateRadarImage(radialsAtElev, 'spectrum', RADAR_IMAGE_SIZE, rangeKm)
+    : null;
+
+  if (!refImg) return null;
+
+  const latDiff = rangeKm / 111.32;
+  const lonDiff = rangeKm / (111.32 * Math.cos(deg2rad(sLat)));
+  const bounds = [
+    [sLat - latDiff, sLon - lonDiff],
+    [sLat + latDiff, sLon + lonDiff]
+  ];
+
+  return {
+    reflectivity: `data:image/png;base64,${refImg.toString('base64')}`,
+    velocity: velImg ? `data:image/png;base64,${velImg.toString('base64')}` : null,
+    spectralWidth: swImg ? `data:image/png;base64,${swImg.toString('base64')}` : null,
+    bounds,
+    elevation: minElevAngle,
+    timestamp,
+  };
 }
 
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
@@ -381,99 +466,8 @@ app.post('/api/radar/process', async (req, res) => {
 
     for (const file of files) {
       if (frames.length >= RADAR_MAX_FRAMES) break;
-
-      const fileUrl = `https://unidata-nexrad-level2.s3.amazonaws.com/${file.Key}`;
-      console.log(`[DEBUG] Downloading Level II file: ${fileUrl}`);
-
-      const fileResponse = await axios.get(fileUrl, {
-        responseType: 'arraybuffer',
-        timeout: RADAR_DOWNLOAD_TIMEOUT_MS,
-        maxContentLength: 80 * 1024 * 1024,
-      });
-      const nexradData = new Level2Radar(fileResponse.data);
-      
-      // Group elevations by rounded angle
-      const elevations = nexradData.listElevations();
-      const elevGroups = new Map<number, number[]>();
-      
-      for (const elevNum of elevations) {
-        const radials = nexradData.data[elevNum];
-        if (!radials || radials.length === 0) continue;
-        const angle = Math.round(radials[0].record.elevation_angle * 10) / 10;
-        if (!elevGroups.has(angle)) elevGroups.set(angle, []);
-        elevGroups.get(angle)!.push(elevNum);
-      }
-
-      // Find the lowest angle that has all three data types
-      let targetElevNums: number[] = [];
-      let minElevAngle = 999;
-
-      for (const [angle, elevNums] of Array.from(elevGroups.entries()).sort((a, b) => a[0] - b[0])) {
-        let hasReflect = false;
-        let hasVelocity = false;
-        let hasSpectrum = false;
-
-        for (const e of elevNums) {
-          const rds = nexradData.data[e];
-          if (!rds) continue;
-          for (const r of rds) {
-            if (r.record.reflect) hasReflect = true;
-            if (r.record.velocity) hasVelocity = true;
-            if (r.record.spectrum) hasSpectrum = true;
-            if (hasReflect && hasVelocity && hasSpectrum) break;
-          }
-          if (hasReflect && hasVelocity && hasSpectrum) break;
-        }
-
-        if (hasReflect && hasVelocity && hasSpectrum) {
-          minElevAngle = angle;
-          targetElevNums = elevNums;
-          break;
-        }
-      }
-
-      if (targetElevNums.length === 0) {
-        console.log(`[DEBUG] No elevation found with all three data types in file ${file.Key}. Skipping.`);
-        continue;
-      }
-
-      console.log(`[DEBUG] Lowest elevation angle with all data: ${minElevAngle} deg (Elevations: ${targetElevNums.join(', ')})`);
-
-      // We only need to process the merged radials once per file
-      const allRadialsAtThisElev = [];
-      for (const e of targetElevNums) {
-        const rds = nexradData.data[e];
-        if (rds) allRadialsAtThisElev.push(...rds.map((r: any) => r.record));
-      }
-      
-      const firstRadial = allRadialsAtThisElev[0];
-      const rangeKm = 250;
-
-      const refImg = await generateRadarImage(allRadialsAtThisElev, 'reflect', RADAR_IMAGE_SIZE, rangeKm);
-      const velImg = await generateRadarImage(allRadialsAtThisElev, 'velocity', RADAR_IMAGE_SIZE, rangeKm);
-      const swImg = await generateRadarImage(allRadialsAtThisElev, 'spectrum', RADAR_IMAGE_SIZE, rangeKm);
-      const refImgMap = await generateRadarImage(allRadialsAtThisElev, 'reflect', RADAR_MAP_IMAGE_SIZE, rangeKm, true, [sLat, sLon]);
-      const velImgMap = await generateRadarImage(allRadialsAtThisElev, 'velocity', RADAR_MAP_IMAGE_SIZE, rangeKm, true, [sLat, sLon]);
-
-      if (refImg) {
-        const latDiff = rangeKm / 111.32;
-        const lonDiff = rangeKm / (111.32 * Math.cos(deg2rad(sLat)));
-        const bounds = [
-          [sLat - latDiff, sLon - lonDiff],
-          [sLat + latDiff, sLon + lonDiff]
-        ];
-
-        frames.push({
-          reflectivity: `data:image/png;base64,${refImg.toString('base64')}`,
-          velocity: velImg ? `data:image/png;base64,${velImg.toString('base64')}` : null,
-          spectralWidth: swImg ? `data:image/png;base64,${swImg.toString('base64')}` : null,
-          reflectivityMap: refImgMap ? `data:image/png;base64,${refImgMap.toString('base64')}` : null,
-          velocityMap: velImgMap ? `data:image/png;base64,${velImgMap.toString('base64')}` : null,
-          bounds,
-          elevation: minElevAngle,
-          timestamp: new Date(nexradData.header.modified_julian_date * 86400000 + firstRadial.mseconds).getTime()
-        });
-      }
+      const frame = await processNexradFile(file.Key, sLat, sLon);
+      if (frame) frames.push(frame);
     }
 
     // Sort frames chronologically
@@ -510,7 +504,7 @@ async function startServer() {
   }
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Radar settings: size=${RADAR_IMAGE_SIZE}, mapSize=${RADAR_MAP_IMAGE_SIZE}, maxFrames=${RADAR_MAX_FRAMES}`);
+    console.log(`Radar settings: size=${RADAR_IMAGE_SIZE}, maxFrames=${RADAR_MAX_FRAMES}, spectralWidth=${RADAR_INCLUDE_SPECTRAL_WIDTH}`);
   });
 }
 
